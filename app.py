@@ -1,75 +1,77 @@
 import streamlit as st
 import tempfile
 import os
-import cv2
-import numpy as np
 import pandas as pd
 import plotly.express as px
 from analyzer import PitStopAnalyzer
 
-st.set_page_config(page_title="Pit Stop AI - Dynamic", layout="wide")
+st.set_page_config(page_title="Endurance Pit AI", layout="wide")
 
-st.title("🏎️ Dynamic Pit Stop Analyzer")
-st.markdown("This system automatically detects the car position to align analysis zones.")
+st.title("🏎️ Endurance Pit Stop Analyzer")
+st.markdown("""
+**Configuration:**
+- **Flow:** Left to Right
+- **Roles:** Driver Change (Top), Fuel (Bottom Mid), Tires (Corners)
+- **Tech:** YOLOv8 Human Detection + Color Anchoring
+""")
 
-uploaded_file = st.sidebar.file_uploader("Upload Video", type=["mp4", "mov", "avi"])
+uploaded_file = st.sidebar.file_uploader("Upload Pit Stop Video", type=["mp4", "mov"])
 
-if uploaded_file is not None:
+if uploaded_file:
     tfile = tempfile.NamedTemporaryFile(delete=False) 
     tfile.write(uploaded_file.read())
     video_path = tfile.name
 
-    # Preview
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        st.video(video_path)
-    
-    with col2:
-        st.info("System Logic:")
-        st.markdown("""
-        1. Scans video for **Neon Yellow/Green** car body.
-        2. Waits for car to become **stationary**.
-        3. Calculates geometry and **rotates zones** to match car angle.
-        4. Measure crew activity in those zones.
-        """)
-
-    if st.button("Start Analysis"):
+    if st.button("Run Analysis"):
+        st.info("Downloading AI Model & Processing... (First run takes 30s)")
+        
         analyzer = PitStopAnalyzer(video_path)
-        
         progress_bar = st.progress(0)
-        status_text = st.empty()
         
-        status_text.text("Calibrating car position...")
+        output_path, df = analyzer.process(progress_callback=progress_bar.progress)
         
-        output_video_path, df = analyzer.process(progress_callback=progress_bar.progress)
+        st.success("Processing Complete")
         
-        status_text.text("Processing Complete.")
-        
-        st.divider()
-        
-        # Results
+        # Video
+        with open(output_path, 'rb') as f:
+            st.download_button("Download Overlay Video", f.read(), "analyzed_pit.mp4")
+            
+        # Stats
         if not df.empty:
-            st.subheader("⏱️ Pit Stop Timeline")
+            st.subheader("⏱️ Crew Performance")
             
-            # Clean up timeline for display
-            df['Label'] = df.apply(lambda x: f"{x['Task']} ({x['Duration']:.2f}s)", axis=1)
+            # Sort chronologically by who started working first
+            df = df.sort_values("First Activity")
             
-            fig = px.timeline(df, x_start="Start", x_end="Finish", y="Task", color="Task", text="Label")
-            fig.update_yaxes(autorange="reversed")
-            fig.layout.xaxis.type = 'linear'
-            fig.data[0].x = df.Duration.tolist()
+            # Bar Chart for Duration
+            fig = px.bar(df, x="Total Duration", y="Task", orientation='h', 
+                         title="Time Spent in Work Zone", color="Task")
             st.plotly_chart(fig, use_container_width=True)
             
-            # Stats Table
-            st.dataframe(df.sort_values(by="Start"))
+            st.dataframe(df)
             
+            # Insight logic based on user description
+            st.markdown("### 🧠 AI Insights")
+            
+            try:
+                fuel_time = df.loc[df['Task'] == 'Fueling', 'Total Duration'].values[0]
+                st.write(f"**Fuel Time:** {fuel_time}s")
+            except:
+                st.write("Fueler not detected consistently.")
+                
+            try:
+                # Compare Front vs Rear Tire speed
+                of_time = df.loc[df['Task'] == 'Outside_Front', 'Total Duration'].values[0]
+                or_time = df.loc[df['Task'] == 'Outside_Rear', 'Total Duration'].values[0]
+                
+                if of_time > or_time:
+                    st.write(f"⚠️ **Outside Front** took {of_time - or_time:.2f}s longer than Outside Rear.")
+                else:
+                    st.write(f"✅ **Outside Front** was faster than Rear.")
+            except:
+                pass
+                
         else:
-            st.warning("Analysis finished, but no distinct crew movements were detected after the car stopped.")
-
-        # Download
-        with open(output_video_path, 'rb') as f:
-            video_bytes = f.read()
+            st.warning("No crew activity detected. Check video lighting or camera angle.")
             
-        st.download_button("Download Analyzed Video", video_bytes, "analyzed_pitstop.mp4", "video/mp4")
-        
-        os.unlink(output_video_path)
+        os.unlink(output_path)
