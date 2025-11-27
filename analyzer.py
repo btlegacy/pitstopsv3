@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import tempfile
+from ultralytics import YOLO
 
 class PitStopAnalyzer:
     def __init__(self, video_path):
@@ -11,96 +12,106 @@ class PitStopAnalyzer:
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
         
-        self.fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
+        # Load Standard YOLOv8 Nano model (Small, Fast, detects 'person')
+        # It will auto-download on first run
+        self.model = YOLO('yolov8n.pt') 
+        
         self.car_detected = False
         self.zones = {}
         self.activity_log = []
-        self.state = {}
         
-        # Debug: Store the detected car rect for visualization
-        self.car_rect_points = None
+        # Tracking duration of activity in zones
+        # format: "ZoneName": {active_frames: 0, last_active: False, start_frame: 0}
+        self.zone_stats = {}
 
-    def find_car_alignment(self, frame):
+        # Car Rect for visualization
+        self.car_bbox = None 
+
+    def find_car(self, frame):
+        """
+        Locate the Vasser Sullivan Lexus using HSV Color.
+        """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # HSV for Vasser Sullivan Yellow
-        # If detection fails, try widening this range
+        # Tuned for Neon Yellow
         lower_yellow = np.array([20, 50, 50])
         upper_yellow = np.array([50, 255, 255])
-        
         mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
         
-        # --- FIX 1: HEAVY DILATION ---
-        # The camo pattern breaks the car into pieces. 
-        # We dilate (smear) the mask to connect them into one big blob.
+        # Heavy dilation to merge camo patches
         kernel = np.ones((20, 20), np.uint8) 
         mask = cv2.dilate(mask, kernel, iterations=3)
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        if not contours:
-            return None
+        if not contours: return None
         
-        # Find largest contour
         c = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(c)
+        if cv2.contourArea(c) < (self.width * self.height * 0.05): return None
         
-        # Threshold: Must be a significant portion of the screen (e.g. > 5% of pixels)
-        if area < (self.width * self.height * 0.05): 
-            return None
-            
-        rect = cv2.minAreaRect(c)
-        (center, size, angle) = rect
-        (w, h) = size
+        x, y, w, h = cv2.boundingRect(c)
+        return (x, y, w, h)
 
-        # --- FIX 2: ORIENTATION LOGIC ---
-        # Ensure 'Width' is the long side (Length of car)
-        if w < h:
-            w, h = h, w
-            angle += 90
-            
-        return center, (w, h), angle, cv2.boxPoints(rect)
-
-    def generate_dynamic_zones(self, center, size, angle):
-        cx, cy = center
-        w, h = size # w = Car Length, h = Car Width
+    def generate_zones(self, car_box):
+        """
+        Generates zones based on User Description:
+        Car moves Left -> Right.
+        Top = Outside. Bottom = Inside.
+        """
+        cx, cy, cw, ch = car_box
         
-        # --- FIX 3: WIDER OFFSETS ---
-        # 0.0 is center. 0.5 is edge of car body.
-        # We need > 0.5 to target the tires/mechanics.
-        offsets = {
-            "FL_Tire":  (-0.35, -0.75), # Moved from -0.60 to -0.75
-            "FR_Tire":  (-0.35,  0.75), 
-            "RL_Tire":  ( 0.35, -0.75), 
-            "RR_Tire":  ( 0.35,  0.75), 
-            "Fuel_Rig": ( 0.15, -0.75), 
-            "Jack_R":   ( 0.60,  0.00)  
+        # Center of the car
+        center_x = cx + cw // 2
+        center_y = cy + ch // 2
+        
+        # Dimensions for zones (Approx 1/3 car length, 1/2 car width)
+        zw = int(cw * 0.35) 
+        zh = int(ch * 0.5)
+        
+        # Padding to push zones away from car body
+        pad_y = int(ch * 0.2) 
+
+        # Based on Left->Right Movement:
+        # Front is RIGHT (Higher X), Rear is LEFT (Lower X)
+        # Outside is TOP (Lower Y), Inside is BOTTOM (Higher Y)
+        
+        zones = {
+            # Top Right
+            "Outside_Front": [center_x, cy - zh - pad_y, zw, zh],
+            
+            # Bottom Right
+            "Inside_Front":  [center_x, cy + ch + pad_y, zw, zh],
+            
+            # Top Left
+            "Outside_Rear":  [center_x - zw, cy - zh - pad_y, zw, zh],
+            
+            # Bottom Left
+            "Inside_Rear":   [center_x - zw, cy + ch + pad_y, zw, zh],
+            
+            # Bottom Middle (Fueler)
+            "Fueling":       [center_x - zw//2, cy + ch, zw, zh],
+            
+            # Top Middle (Driver Change)
+            "Driver_Change": [center_x - zw//2, cy - zh, zw, zh]
         }
-
-        zones = {}
-        rad = np.radians(angle)
-        cos_a = np.cos(rad)
-        sin_a = np.sin(rad)
-
-        for name, (off_x, off_y) in offsets.items():
-            # Apply offsets to car dimensions
-            dx = w * off_x
-            dy = h * off_y
-            
-            # Rotate
-            new_dx = dx * cos_a - dy * sin_a
-            new_dy = dx * sin_a + dy * cos_a
-            
-            zone_cx = int(cx + new_dx)
-            zone_cy = int(cy + new_dy)
-            
-            # --- FIX 4: LARGER BOXES ---
-            # Box size relative to car width
-            box_s = int(h * 0.6) 
-            
-            zones[name] = [zone_cx - box_s//2, zone_cy - box_s//2, box_s, box_s]
-            
+        
+        # Initialize stats
+        self.zone_stats = {k: {'frames': 0, 'active': False, 'starts': []} for k in zones.keys()}
+        
         return zones
+
+    def check_overlap(self, person_box, zone_box):
+        """
+        Simple AABB Collision detection
+        """
+        px1, py1, px2, py2 = person_box
+        zx, zy, zw, zh = zone_box
+        zx2, zy2 = zx + zw, zy + zh
+        
+        # Check if they intersect
+        if (px1 < zx2 and px2 > zx and py1 < zy2 and py2 > zy):
+            return True
+        return False
 
     def process(self, progress_callback=None):
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -110,87 +121,84 @@ class PitStopAnalyzer:
 
         frame_count = 0
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frames_stable = 0
-        last_center = None
+        
+        # Variables for car locking
+        stable_frames = 0
+        last_car_pos = None
 
         while True:
             ret, frame = self.cap.read()
-            if not ret:
-                break
+            if not ret: break
             
-            current_time = frame_count / self.fps
-            
+            # 1. Car Detection Phase
             if not self.car_detected:
-                result = self.find_car_alignment(frame)
+                car_box = self.find_car(frame)
                 
-                if result:
-                    center, size, angle, box_points = result
+                if car_box:
+                    (x, y, w, h) = car_box
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 0), 2)
+                    cv2.putText(frame, "Aligning...", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
                     
-                    # Store for drawing
-                    self.car_rect_points = np.int32(box_points)
+                    if last_car_pos:
+                        # Check if car stopped moving
+                        dist = abs(x - last_car_pos[0]) + abs(y - last_car_pos[1])
+                        if dist < 5: stable_frames += 1
+                        else: stable_frames = 0
                     
-                    # Check stability
-                    if last_center:
-                        movement = np.linalg.norm(np.array(center) - np.array(last_center))
-                        if movement < 3.0: 
-                            frames_stable += 1
-                        else:
-                            frames_stable = 0
-                    last_center = center
+                    last_car_pos = (x, y, w, h)
                     
-                    # Lock on faster (0.3s)
-                    if frames_stable > (self.fps * 0.3):
-                        self.zones = self.generate_dynamic_zones(center, size, angle)
+                    if stable_frames > 15: # Approx 0.5s stable
+                        self.zones = self.generate_zones(last_car_pos)
                         self.car_detected = True
-                        self.state = {k: {'active': False, 'start_time': 0, 'last_seen': 0} for k in self.zones}
-                
-                # Draw Debug Car Box (Cyan)
-                if self.car_rect_points is not None:
-                    cv2.drawContours(frame, [self.car_rect_points], 0, (255, 255, 0), 3)
-                    cv2.putText(frame, "DETECTING CAR...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-
+                        self.car_bbox = last_car_pos
+            
+            # 2. Analysis Phase
             else:
-                # Normal processing
-                fgmask = self.fgbg.apply(frame)
-                _, thresh = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
+                # Draw Car Anchor
+                cx, cy, cw, ch = self.car_bbox
+                cv2.rectangle(frame, (cx, cy), (cx+cw, cy+ch), (255, 255, 0), 1)
+
+                # Run YOLOv8 detection
+                # classes=[0] means only detect Class 0 (Person)
+                results = self.model.predict(frame, conf=0.3, classes=[0], verbose=False)
                 
-                # Draw Debug Car Box (Cyan) to show anchor
-                if self.car_rect_points is not None:
-                    cv2.drawContours(frame, [self.car_rect_points], 0, (255, 255, 0), 2)
+                current_active_zones = []
 
-                for name, (x, y, w, h) in self.zones.items():
-                    # Clamp coordinates
-                    x, y = max(0, x), max(0, y)
-                    roi = thresh[y:y+h, x:x+w]
+                for r in results:
+                    boxes = r.boxes
+                    for box in boxes:
+                        # Get person coordinates
+                        x1, y1, x2, y2 = box.xyxy[0]
+                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                        
+                        # Draw Person
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 0), 1)
+                        
+                        # Check overlapping zones
+                        for z_name, z_box in self.zones.items():
+                            if self.check_overlap((x1, y1, x2, y2), z_box):
+                                current_active_zones.append(z_name)
+
+                # Update Logic
+                for z_name, z_box in self.zones.items():
+                    zx, zy, zw, zh = z_box
                     
-                    is_moving = False
-                    if roi.size > 0:
-                        white_pixels = np.sum(roi == 255)
-                        motion_ratio = white_pixels / (w * h)
-                        is_moving = motion_ratio > 0.15
-
-                    color = (0, 255, 0)
-                    if is_moving:
-                        self.state[name]['last_seen'] = current_time
-                        if not self.state[name]['active']:
-                            self.state[name]['active'] = True
-                            self.state[name]['start_time'] = current_time
+                    # Determine color based on activity
+                    is_active = z_name in current_active_zones
                     
-                    if self.state[name]['active']:
-                        color = (0, 0, 255)
-                        if (current_time - self.state[name]['last_seen']) > 0.5:
-                            duration = self.state[name]['last_seen'] - self.state[name]['start_time']
-                            if duration > 1.5:
-                                self.activity_log.append({
-                                    "Task": name,
-                                    "Start": self.state[name]['start_time'],
-                                    "Finish": self.state[name]['last_seen'],
-                                    "Duration": duration
-                                })
-                            self.state[name]['active'] = False
-
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-                    cv2.putText(frame, name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    if is_active:
+                        color = (0, 0, 255) # RED = Working
+                        self.zone_stats[z_name]['frames'] += 1
+                        if not self.zone_stats[z_name]['active']:
+                             self.zone_stats[z_name]['starts'].append(frame_count / self.fps)
+                        self.zone_stats[z_name]['active'] = True
+                    else:
+                        color = (0, 255, 0) # GREEN = Empty
+                        self.zone_stats[z_name]['active'] = False
+                    
+                    # Draw Zone
+                    cv2.rectangle(frame, (zx, zy), (zx+zw, zy+zh), color, 2)
+                    cv2.putText(frame, z_name, (zx, zy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             out.write(frame)
             frame_count += 1
@@ -199,4 +207,17 @@ class PitStopAnalyzer:
 
         self.cap.release()
         out.release()
-        return output_path, pd.DataFrame(self.activity_log)
+        
+        # Compile Report
+        final_log = []
+        for name, stats in self.zone_stats.items():
+            duration = stats['frames'] / self.fps
+            if duration > 1.0: # Ignore noise
+                final_log.append({
+                    "Task": name, 
+                    "Total Duration": round(duration, 2),
+                    # Simple heuristic: Start time is the first time someone entered the zone
+                    "First Activity": round(stats['starts'][0], 2) if stats['starts'] else 0
+                })
+                
+        return output_path, pd.DataFrame(final_log)
