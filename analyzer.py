@@ -11,100 +11,93 @@ class PitStopAnalyzer:
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
         
-        # Background subtractor
         self.fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False)
-        
-        # State tracking
         self.car_detected = False
-        self.zones = {} # Will be populated dynamically
+        self.zones = {}
         self.activity_log = []
         self.state = {}
+        
+        # Debug: Store the detected car rect for visualization
+        self.car_rect_points = None
 
     def find_car_alignment(self, frame):
-        """
-        Detects the car based on neon yellow/green color and determines orientation.
-        Returns: (center_x, center_y), (width, height), angle, box_points
-        """
-        # Convert to HSV color space
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # HSV range for the "Highlighter Yellow" (Vasser Sullivan / Aston Martin colors)
-        lower_yellow = np.array([25, 50, 50])
-        upper_yellow = np.array([45, 255, 255])
+        # HSV for Vasser Sullivan Yellow
+        # If detection fails, try widening this range
+        lower_yellow = np.array([20, 50, 50])
+        upper_yellow = np.array([50, 255, 255])
         
         mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
         
-        # Clean up mask
-        kernel = np.ones((5,5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        # --- FIX 1: HEAVY DILATION ---
+        # The camo pattern breaks the car into pieces. 
+        # We dilate (smear) the mask to connect them into one big blob.
+        kernel = np.ones((20, 20), np.uint8) 
+        mask = cv2.dilate(mask, kernel, iterations=3)
         
-        # Find contours
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
             return None
         
-        # Find the largest contour (the car body)
+        # Find largest contour
         c = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(c)
         
-        # Filter small noise
-        if area < 5000: 
+        # Threshold: Must be a significant portion of the screen (e.g. > 5% of pixels)
+        if area < (self.width * self.height * 0.05): 
             return None
             
-        # Get Rotated Bounding Box
         rect = cv2.minAreaRect(c)
         (center, size, angle) = rect
-        
-        # Normalizing angle logic for OpenCV versions
-        if size[0] < size[1]:
-            angle = angle + 90
-            size = (size[1], size[0]) # Swap to make width always the "long" side
+        (w, h) = size
 
-        return center, size, angle, cv2.boxPoints(rect)
+        # --- FIX 2: ORIENTATION LOGIC ---
+        # Ensure 'Width' is the long side (Length of car)
+        if w < h:
+            w, h = h, w
+            angle += 90
+            
+        return center, (w, h), angle, cv2.boxPoints(rect)
 
     def generate_dynamic_zones(self, center, size, angle):
-        """
-        Creates zones relative to the car's center and rotation.
-        """
         cx, cy = center
-        w, h = size # w is length of car, h is width of car
+        w, h = size # w = Car Length, h = Car Width
         
-        # Geometric Multipliers (Tuned to typical GT3 Car proportions)
+        # --- FIX 3: WIDER OFFSETS ---
+        # 0.0 is center. 0.5 is edge of car body.
+        # We need > 0.5 to target the tires/mechanics.
         offsets = {
-            "FL_Tire":  (-0.35, -0.60), # Front Left
-            "FR_Tire":  (-0.35,  0.60), # Front Right
-            "RL_Tire":  ( 0.35, -0.60), # Rear Left
-            "RR_Tire":  ( 0.35,  0.60), # Rear Right
-            "Fuel_Rig": ( 0.10, -0.40), # Mid-rear
-            "Jack":     ( 0.55,  0.00)  # Rear Jack
+            "FL_Tire":  (-0.35, -0.75), # Moved from -0.60 to -0.75
+            "FR_Tire":  (-0.35,  0.75), 
+            "RL_Tire":  ( 0.35, -0.75), 
+            "RR_Tire":  ( 0.35,  0.75), 
+            "Fuel_Rig": ( 0.15, -0.75), 
+            "Jack_R":   ( 0.60,  0.00)  
         }
 
         zones = {}
-        
-        # Convert angle to radians
         rad = np.radians(angle)
         cos_a = np.cos(rad)
         sin_a = np.sin(rad)
 
         for name, (off_x, off_y) in offsets.items():
-            # Calculate unrotated offset
+            # Apply offsets to car dimensions
             dx = w * off_x
             dy = h * off_y
             
-            # Rotate the offset
+            # Rotate
             new_dx = dx * cos_a - dy * sin_a
             new_dy = dx * sin_a + dy * cos_a
             
-            # New center
             zone_cx = int(cx + new_dx)
             zone_cy = int(cy + new_dy)
             
-            # Define box size (approx 120x120 pixels, scaled by car size)
-            box_s = int(h * 0.4) 
+            # --- FIX 4: LARGER BOXES ---
+            # Box size relative to car width
+            box_s = int(h * 0.6) 
             
-            # Store as [x, y, w, h] for OpenCV
             zones[name] = [zone_cx - box_s//2, zone_cy - box_s//2, box_s, box_s]
             
         return zones
@@ -117,8 +110,6 @@ class PitStopAnalyzer:
 
         frame_count = 0
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Calibration Phase variables
         frames_stable = 0
         last_center = None
 
@@ -129,55 +120,55 @@ class PitStopAnalyzer:
             
             current_time = frame_count / self.fps
             
-            # --- Phase 1: Dynamic Calibration (Wait for Car to Stop) ---
             if not self.car_detected:
-                # Try to find car
                 result = self.find_car_alignment(frame)
                 
                 if result:
                     center, size, angle, box_points = result
                     
-                    # --- FIX APPLIED HERE: np.int0 -> np.int32 ---
-                    box = np.int32(box_points) 
-                    cv2.drawContours(frame, [box], 0, (255, 255, 0), 2)
+                    # Store for drawing
+                    self.car_rect_points = np.int32(box_points)
                     
-                    # Check if stationary
+                    # Check stability
                     if last_center:
                         movement = np.linalg.norm(np.array(center) - np.array(last_center))
-                        if movement < 2.0: # Moving less than 2 pixels per frame
+                        if movement < 3.0: 
                             frames_stable += 1
                         else:
                             frames_stable = 0
-                    
                     last_center = center
                     
-                    # If stable for 0.5 seconds, LOCK THE ZONES
-                    if frames_stable > (self.fps * 0.5):
+                    # Lock on faster (0.3s)
+                    if frames_stable > (self.fps * 0.3):
                         self.zones = self.generate_dynamic_zones(center, size, angle)
                         self.car_detected = True
-                        # Initialize state tracking for these new zones
                         self.state = {k: {'active': False, 'start_time': 0, 'last_seen': 0} for k in self.zones}
-                        
-            # --- Phase 2: Analysis (Once car is locked) ---
+                
+                # Draw Debug Car Box (Cyan)
+                if self.car_rect_points is not None:
+                    cv2.drawContours(frame, [self.car_rect_points], 0, (255, 255, 0), 3)
+                    cv2.putText(frame, "DETECTING CAR...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
             else:
-                # 1. Motion Detection
+                # Normal processing
                 fgmask = self.fgbg.apply(frame)
                 _, thresh = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
                 
-                # 2. Check Dynamic Zones
-                for name, (x, y, w, h) in self.zones.items():
-                    # Ensure roi is within frame bounds
-                    x, y = max(0, x), max(0, y)
-                    
-                    roi = thresh[y:y+h, x:x+w]
-                    if roi.size == 0: continue
+                # Draw Debug Car Box (Cyan) to show anchor
+                if self.car_rect_points is not None:
+                    cv2.drawContours(frame, [self.car_rect_points], 0, (255, 255, 0), 2)
 
-                    white_pixels = np.sum(roi == 255)
-                    motion_ratio = white_pixels / (w * h)
+                for name, (x, y, w, h) in self.zones.items():
+                    # Clamp coordinates
+                    x, y = max(0, x), max(0, y)
+                    roi = thresh[y:y+h, x:x+w]
                     
-                    is_moving = motion_ratio > 0.15 # 15% threshold
-                    
-                    # Logic
+                    is_moving = False
+                    if roi.size > 0:
+                        white_pixels = np.sum(roi == 255)
+                        motion_ratio = white_pixels / (w * h)
+                        is_moving = motion_ratio > 0.15
+
                     color = (0, 255, 0)
                     if is_moving:
                         self.state[name]['last_seen'] = current_time
@@ -198,9 +189,8 @@ class PitStopAnalyzer:
                                 })
                             self.state[name]['active'] = False
 
-                    # Draw Zone
                     cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
-                    cv2.putText(frame, name, (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    cv2.putText(frame, name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
             out.write(frame)
             frame_count += 1
@@ -209,5 +199,4 @@ class PitStopAnalyzer:
 
         self.cap.release()
         out.release()
-        
         return output_path, pd.DataFrame(self.activity_log)
