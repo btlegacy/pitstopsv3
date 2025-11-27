@@ -29,7 +29,6 @@ class PitStopAnalyzer:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
         # HSV range for the "Highlighter Yellow" (Vasser Sullivan / Aston Martin colors)
-        # You might need to tune these sliders in a real UI, but this is a good baseline
         lower_yellow = np.array([25, 50, 50])
         upper_yellow = np.array([45, 255, 255])
         
@@ -50,7 +49,7 @@ class PitStopAnalyzer:
         c = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(c)
         
-        # Filter small noise (e.g. a crew member's helmet)
+        # Filter small noise
         if area < 5000: 
             return None
             
@@ -68,20 +67,17 @@ class PitStopAnalyzer:
     def generate_dynamic_zones(self, center, size, angle):
         """
         Creates zones relative to the car's center and rotation.
-        Assumes Car is facing LEFT based on the screenshot (Rear wing on right).
         """
         cx, cy = center
         w, h = size # w is length of car, h is width of car
         
         # Geometric Multipliers (Tuned to typical GT3 Car proportions)
-        # These offsets move the center of the ROI relative to the car center
-        # X is along the length of car, Y is along width
         offsets = {
-            "FL_Tire":  (-0.35, -0.60), # Front Left (Top Left relative to car center)
+            "FL_Tire":  (-0.35, -0.60), # Front Left
             "FR_Tire":  (-0.35,  0.60), # Front Right
             "RL_Tire":  ( 0.35, -0.60), # Rear Left
             "RR_Tire":  ( 0.35,  0.60), # Rear Right
-            "Fuel_Rig": ( 0.10, -0.40), # Usually mid-rear
+            "Fuel_Rig": ( 0.10, -0.40), # Mid-rear
             "Jack":     ( 0.55,  0.00)  # Rear Jack
         }
 
@@ -141,8 +137,8 @@ class PitStopAnalyzer:
                 if result:
                     center, size, angle, box_points = result
                     
-                    # Draw detecting box (Blue)
-                    box = np.int0(box_points)
+                    # --- FIX APPLIED HERE: np.int0 -> np.int32 ---
+                    box = np.int32(box_points) 
                     cv2.drawContours(frame, [box], 0, (255, 255, 0), 2)
                     
                     # Check if stationary
