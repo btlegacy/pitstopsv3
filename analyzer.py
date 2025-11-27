@@ -2,116 +2,89 @@ import cv2
 import numpy as np
 import pandas as pd
 import tempfile
-from ultralytics import YOLO
 
 class PitStopAnalyzer:
-    def __init__(self, video_path):
+    def __init__(self, video_path, sensitivity=25):
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = int(self.cap.get(cv2.CAP_PROP_FPS))
         
-        # Load Standard YOLOv8 Nano model (Small, Fast, detects 'person')
-        # It will auto-download on first run
-        self.model = YOLO('yolov8n.pt') 
+        # MOG2 Background Subtractor (Detects moving pixels)
+        # varThreshold: Lower = More Sensitive
+        self.fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=sensitivity, detectShadows=False)
         
         self.car_detected = False
+        self.car_bbox = None
         self.zones = {}
-        self.activity_log = []
         
-        # Tracking duration of activity in zones
-        # format: "ZoneName": {active_frames: 0, last_active: False, start_frame: 0}
+        # Tracking Data
         self.zone_stats = {}
-
-        # Car Rect for visualization
-        self.car_bbox = None 
+        self.debug_frame = None
 
     def find_car(self, frame):
         """
-        Locate the Vasser Sullivan Lexus using HSV Color.
+        Locates the Vasser Sullivan Neon Yellow Car.
         """
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Tuned for Neon Yellow
-        lower_yellow = np.array([20, 50, 50])
-        upper_yellow = np.array([50, 255, 255])
+        # WIDENED THRESHOLDS: Covers Greenish-Yellow to Orange-Yellow
+        lower_yellow = np.array([15, 60, 60]) 
+        upper_yellow = np.array([65, 255, 255])
+        
         mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
         
-        # Heavy dilation to merge camo patches
-        kernel = np.ones((20, 20), np.uint8) 
-        mask = cv2.dilate(mask, kernel, iterations=3)
+        # Heavy dilation to merge camo pattern into one blob
+        kernel = np.ones((15, 15), np.uint8) 
+        mask = cv2.dilate(mask, kernel, iterations=4)
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours: return None
         
+        # Get largest blob
         c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) < (self.width * self.height * 0.05): return None
+        area = cv2.contourArea(c)
+        
+        # Must be at least 5% of the screen
+        if area < (self.width * self.height * 0.05): return None
         
         x, y, w, h = cv2.boundingRect(c)
         return (x, y, w, h)
 
     def generate_zones(self, car_box):
-        """
-        Generates zones based on User Description:
-        Car moves Left -> Right.
-        Top = Outside. Bottom = Inside.
-        """
         cx, cy, cw, ch = car_box
         
-        # Center of the car
+        # Center of Car
         center_x = cx + cw // 2
         center_y = cy + ch // 2
         
-        # Dimensions for zones (Approx 1/3 car length, 1/2 car width)
-        zw = int(cw * 0.35) 
-        zh = int(ch * 0.5)
+        # Box Sizes (Tuned for GT3 shape)
+        zw = int(cw * 0.3) # Zone Width
+        zh = int(ch * 0.6) # Zone Height
         
-        # Padding to push zones away from car body
-        pad_y = int(ch * 0.2) 
-
-        # Based on Left->Right Movement:
-        # Front is RIGHT (Higher X), Rear is LEFT (Lower X)
-        # Outside is TOP (Lower Y), Inside is BOTTOM (Higher Y)
+        # Spacing (Push boxes away from car body)
+        pad_y = int(ch * 0.25)
         
+        # ZONES CONFIGURATION
+        # Based on: Car moving Left->Right. Top=Outside. Bottom=Inside.
         zones = {
-            # Top Right
-            "Outside_Front": [center_x, cy - zh - pad_y, zw, zh],
+            # TIRES
+            "Outside_Front": [center_x + int(cw*0.2), cy - zh - pad_y, zw, zh],
+            "Inside_Front":  [center_x + int(cw*0.2), cy + ch + pad_y, zw, zh],
+            "Outside_Rear":  [center_x - int(cw*0.3), cy - zh - pad_y, zw, zh],
+            "Inside_Rear":   [center_x - int(cw*0.3), cy + ch + pad_y, zw, zh],
             
-            # Bottom Right
-            "Inside_Front":  [center_x, cy + ch + pad_y, zw, zh],
-            
-            # Top Left
-            "Outside_Rear":  [center_x - zw, cy - zh - pad_y, zw, zh],
-            
-            # Bottom Left
-            "Inside_Rear":   [center_x - zw, cy + ch + pad_y, zw, zh],
-            
-            # Bottom Middle (Fueler)
-            "Fueling":       [center_x - zw//2, cy + ch, zw, zh],
-            
-            # Top Middle (Driver Change)
-            "Driver_Change": [center_x - zw//2, cy - zh, zw, zh]
+            # SERVICES
+            "Driver_Change": [center_x - int(cw*0.1), cy - zh - pad_y, zw, zh], # Top Middle
+            "Fueling":       [center_x - int(cw*0.2), cy + ch, int(cw*0.2), int(zh*0.8)], # Bot Mid
+            "Fire_Bottle":   [center_x - int(cw*0.5), cy + ch + pad_y, int(zw*0.8), int(zh*0.8)] # Behind Fueler
         }
         
-        # Initialize stats
-        self.zone_stats = {k: {'frames': 0, 'active': False, 'starts': []} for k in zones.keys()}
-        
+        # Init stats
+        self.zone_stats = {k: {'active': False, 'start_f': 0, 'end_f': 0, 'total_f': 0} for k in zones}
         return zones
-
-    def check_overlap(self, person_box, zone_box):
-        """
-        Simple AABB Collision detection
-        """
-        px1, py1, px2, py2 = person_box
-        zx, zy, zw, zh = zone_box
-        zx2, zy2 = zx + zw, zy + zh
-        
-        # Check if they intersect
-        if (px1 < zx2 and px2 > zx and py1 < zy2 and py2 > zy):
-            return True
-        return False
 
     def process(self, progress_callback=None):
         tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
@@ -122,83 +95,88 @@ class PitStopAnalyzer:
         frame_count = 0
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # Variables for car locking
-        stable_frames = 0
-        last_car_pos = None
+        # Latching: How many frames a zone stays active after motion stops
+        # 30 frames = ~1 second (Prevents flickering when fueler holds still)
+        patience = 30 
+        cooldowns = {} 
 
         while True:
             ret, frame = self.cap.read()
             if not ret: break
             
-            # 1. Car Detection Phase
+            # --- PHASE 1: FIND CAR ---
             if not self.car_detected:
                 car_box = self.find_car(frame)
-                
                 if car_box:
-                    (x, y, w, h) = car_box
-                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 255, 0), 2)
-                    cv2.putText(frame, "Aligning...", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,0), 2)
+                    # Draw Blue Box to show we found it
+                    (x,y,w,h) = car_box
+                    cv2.rectangle(frame, (x,y), (x+w, y+h), (255, 200, 0), 3)
+                    cv2.putText(frame, "LOCKED", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,200,0), 3)
                     
-                    if last_car_pos:
-                        # Check if car stopped moving
-                        dist = abs(x - last_car_pos[0]) + abs(y - last_car_pos[1])
-                        if dist < 5: stable_frames += 1
-                        else: stable_frames = 0
-                    
-                    last_car_pos = (x, y, w, h)
-                    
-                    if stable_frames > 15: # Approx 0.5s stable
-                        self.zones = self.generate_zones(last_car_pos)
-                        self.car_detected = True
-                        self.car_bbox = last_car_pos
+                    # Lock immediately for now (assuming car is stopped)
+                    # In production, check velocity here
+                    self.car_bbox = car_box
+                    self.zones = self.generate_zones(car_box)
+                    self.car_detected = True
+                    cooldowns = {k: 0 for k in self.zones}
+                else:
+                    cv2.putText(frame, "SEARCHING FOR CAR...", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
             
-            # 2. Analysis Phase
+            # --- PHASE 2: TRACK CREW ---
             else:
-                # Draw Car Anchor
-                cx, cy, cw, ch = self.car_bbox
-                cv2.rectangle(frame, (cx, cy), (cx+cw, cy+ch), (255, 255, 0), 1)
-
-                # Run YOLOv8 detection
-                # classes=[0] means only detect Class 0 (Person)
-                results = self.model.predict(frame, conf=0.3, classes=[0], verbose=False)
+                # 1. Motion Mask
+                fgmask = self.fgbg.apply(frame)
+                # Remove noise
+                _, thresh = cv2.threshold(fgmask, 200, 255, cv2.THRESH_BINARY)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
                 
-                current_active_zones = []
+                # Draw Car Anchor (Blue)
+                cx, cy, cw, ch = self.car_bbox
+                cv2.rectangle(frame, (cx, cy), (cx+cw, cy+ch), (255, 200, 0), 2)
 
-                for r in results:
-                    boxes = r.boxes
-                    for box in boxes:
-                        # Get person coordinates
-                        x1, y1, x2, y2 = box.xyxy[0]
-                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                        
-                        # Draw Person
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 100, 0), 1)
-                        
-                        # Check overlapping zones
-                        for z_name, z_box in self.zones.items():
-                            if self.check_overlap((x1, y1, x2, y2), z_box):
-                                current_active_zones.append(z_name)
+                # 2. Check Zones
+                for name, rect in self.zones.items():
+                    zx, zy, zw, zh = rect
+                    
+                    # Boundary Checks
+                    zx, zy = max(0, zx), max(0, zy)
+                    zw, zh = min(zw, self.width-zx), min(zh, self.height-zy)
+                    
+                    roi = thresh[zy:zy+zh, zx:zx+zw]
+                    if roi.size == 0: continue
 
-                # Update Logic
-                for z_name, z_box in self.zones.items():
-                    zx, zy, zw, zh = z_box
+                    # Calculate Motion Percentage
+                    white_pixels = np.count_nonzero(roi)
+                    total_pixels = zw * zh
+                    ratio = white_pixels / total_pixels
                     
-                    # Determine color based on activity
-                    is_active = z_name in current_active_zones
+                    # Threshold: 5% of the zone must be moving to trigger
+                    is_moving = ratio > 0.05 
                     
-                    if is_active:
-                        color = (0, 0, 255) # RED = Working
-                        self.zone_stats[z_name]['frames'] += 1
-                        if not self.zone_stats[z_name]['active']:
-                             self.zone_stats[z_name]['starts'].append(frame_count / self.fps)
-                        self.zone_stats[z_name]['active'] = True
+                    # Latching Logic
+                    if is_moving:
+                        cooldowns[name] = patience
+                        if not self.zone_stats[name]['active']:
+                            self.zone_stats[name]['active'] = True
+                            self.zone_stats[name]['start_f'] = frame_count
+                    elif cooldowns[name] > 0:
+                        cooldowns[name] -= 1
                     else:
-                        color = (0, 255, 0) # GREEN = Empty
-                        self.zone_stats[z_name]['active'] = False
+                        if self.zone_stats[name]['active']:
+                            # Activity Ended
+                            self.zone_stats[name]['active'] = False
+                            duration = frame_count - self.zone_stats[name]['start_f']
+                            # Only log if activity lasted > 1.5 seconds (ignore drive-by)
+                            if duration > (self.fps * 1.5):
+                                self.zone_stats[name]['total_f'] += duration
+
+                    # Visuals
+                    color = (0, 0, 255) if cooldowns[name] > 0 else (0, 255, 0)
+                    thick = 3 if cooldowns[name] > 0 else 1
                     
-                    # Draw Zone
-                    cv2.rectangle(frame, (zx, zy), (zx+zw, zy+zh), color, 2)
-                    cv2.putText(frame, z_name, (zx, zy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                    cv2.rectangle(frame, (zx, zy), (zx+zw, zy+zh), color, thick)
+                    cv2.putText(frame, name, (zx, zy-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             out.write(frame)
             frame_count += 1
@@ -211,13 +189,11 @@ class PitStopAnalyzer:
         # Compile Report
         final_log = []
         for name, stats in self.zone_stats.items():
-            duration = stats['frames'] / self.fps
-            if duration > 1.0: # Ignore noise
+            duration_sec = stats['total_f'] / self.fps
+            if duration_sec > 0:
                 final_log.append({
-                    "Task": name, 
-                    "Total Duration": round(duration, 2),
-                    # Simple heuristic: Start time is the first time someone entered the zone
-                    "First Activity": round(stats['starts'][0], 2) if stats['starts'] else 0
+                    "Task": name,
+                    "Duration": round(duration_sec, 2)
                 })
-                
+        
         return output_path, pd.DataFrame(final_log)
